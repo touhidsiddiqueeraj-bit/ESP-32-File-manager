@@ -6,10 +6,11 @@
 #include <SPI.h>
 #include <ESPmDNS.h>
 #include <DNSServer.h>
+#include <Preferences.h> // For saving WiFi credentials
 
-// --- WiFi Credentials ---
-const char* ssid = "YOUR_HOME_WIFI";
-const char* password = "YOUR_WIFI_PASSWORD";
+// --- Default WiFi Credentials (Used on first boot or if reset) ---
+String ssid = "YOUR_HOME_WIFI";
+String password = "YOUR_WIFI_PASSWORD";
 
 // --- AP Fallback Credentials ---
 const char* ap_ssid = "ESP32-S3-Drive";
@@ -18,6 +19,7 @@ const char* ap_password = "12345678";
 // --- Server & DNS ---
 WebServer server(80);
 DNSServer dnsServer;
+Preferences preferences;
 
 // --- Storage Management ---
 bool useInternalFS = true;
@@ -36,7 +38,7 @@ uint8_t tar_buf[512];
 #define SD_SCK 10
 #define SD_CS 13
 
-// --- HTML & CSS (Light Mode File Manager UI - Mobile Fixed) ---
+// --- HTML & CSS (Light Mode File Manager UI - Mobile Fixed + WiFi Modal) ---
 const char MAIN_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -67,6 +69,13 @@ const char MAIN_HTML[] PROGMEM = R"rawliteral(
         input[type="file"] { flex: 1 1 100%; padding: 10px; border: 1px dashed #cbd5e1; border-radius: 6px; }
         .status { margin-top: 10px; font-size: 14px; color: #64748b; word-break: break-all; }
         
+        /* Modal Styles */
+        .modal-overlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); justify-content: center; align-items: center; z-index: 1000; }
+        .modal { background: var(--card-bg); padding: 20px; border-radius: 12px; width: 90%; max-width: 400px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+        .modal h3 { margin-top: 0; margin-bottom: 15px; color: var(--text); }
+        .modal input { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid var(--border); border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+        .modal-actions { display: flex; gap: 10px; }
+
         /* Mobile Responsive Tweaks */
         @media (max-width: 600px) {
             body { padding: 0; }
@@ -82,6 +91,7 @@ const char MAIN_HTML[] PROGMEM = R"rawliteral(
 <body>
     <div class="header">
         <h2>ESP32-S3 Storage</h2>
+        <button class="btn btn-secondary" style="flex: 0 0 auto;" onclick="openWifiModal()">⚙️ WiFi</button>
     </div>
     <div class="container">
         <div class="storage-tabs">
@@ -117,6 +127,19 @@ const char MAIN_HTML[] PROGMEM = R"rawliteral(
             <button class="btn" style="flex: 0 0 auto;" onclick="uploadFiles()">Upload</button>
         </div>
         <div class="status" id="statusText"></div>
+    </div>
+
+    <!-- WiFi Settings Modal -->
+    <div class="modal-overlay" id="wifiModal">
+        <div class="modal">
+            <h3>Update WiFi Credentials</h3>
+            <input type="text" id="newSsid" placeholder="WiFi SSID">
+            <input type="password" id="newPass" placeholder="WiFi Password">
+            <div class="modal-actions">
+                <button class="btn btn-secondary" style="flex: 1;" onclick="closeWifiModal()">Cancel</button>
+                <button class="btn" style="flex: 1;" onclick="saveWifi()">Save & Reboot</button>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -214,6 +237,25 @@ const char MAIN_HTML[] PROGMEM = R"rawliteral(
               });
         }
 
+        // WiFi Modal Functions
+        function openWifiModal() { document.getElementById('wifiModal').style.display = 'flex'; }
+        function closeWifiModal() { document.getElementById('wifiModal').style.display = 'none'; }
+        function saveWifi() {
+            const s = document.getElementById('newSsid').value;
+            const p = document.getElementById('newPass').value;
+            if(!s) { alert("SSID cannot be empty"); return; }
+            
+            fetch('/saveWifi', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                body: `ssid=${encodeURIComponent(s)}&pass=${encodeURIComponent(p)}`
+            }).then(res => res.text())
+              .then(data => {
+                  alert("Saved! The ESP32 is rebooting. Please wait 10 seconds and reconnect.");
+                  closeWifiModal();
+              });
+        }
+
         loadFiles("/");
     </script>
 </body>
@@ -258,15 +300,14 @@ void writeTarHeader(WiFiClient &client, String name, size_t size, bool isDir) {
     char sizeStr[12];
     snprintf(sizeStr, 12, "%011o", size);
     strncpy(header + 124, sizeStr, 11);
-    header[135] = ' '; // Space after size
+    header[135] = ' '; 
     
     strncpy(header + 136, "00000000000", 11);
-    header[147] = ' '; // Space after mtime
+    header[147] = ' ';
     
-    memset(header + 148, ' ', 8); // Initialize checksum as spaces
-    header[156] = isDir ? '5' : '0'; // Type flag (5=dir, 0=file)
+    memset(header + 148, ' ', 8);
+    header[156] = isDir ? '5' : '0';
     
-    // Calculate checksum
     int checksum = 0;
     for (int i = 0; i < 512; i++) checksum += header[i];
     
@@ -299,15 +340,14 @@ void streamDirectoryTar(WiFiClient &client, String path) {
                 if (!client.connected()) break;
                 client.write(tar_buf, bytesRead);
                 if (bytesRead < 512) {
-                    // Pad the last block to 512 bytes
                     memset(tar_buf, 0, 512);
                     client.write(tar_buf, 512 - bytesRead);
                 }
-                vTaskDelay(1); // Yield to prevent Watchdog Timer crash
+                vTaskDelay(1);
             }
         }
         file = root.openNextFile();
-        vTaskDelay(1); // Yield between files
+        vTaskDelay(1);
     }
     root.close();
 }
@@ -374,7 +414,6 @@ void handleDownloadAll() {
   
   streamDirectoryTar(client, path);
   
-  // End of TAR file (two 512-byte zero blocks)
   uint8_t eof[1024];
   memset(eof, 0, 1024);
   client.write(eof, 1024);
@@ -434,11 +473,34 @@ void handleUploadComplete() {
   server.send(200, "text/plain", "Upload complete!");
 }
 
+void handleSaveWifi() {
+  if (server.hasArg("ssid")) {
+    String newSsid = server.arg("ssid");
+    String newPass = server.arg("pass");
+    
+    preferences.putString("ssid", newSsid);
+    preferences.putString("password", newPass);
+    
+    server.send(200, "text/plain", "Saved. Rebooting...");
+    
+    // Give the server time to send the response before rebooting
+    delay(1000);
+    ESP.restart();
+  } else {
+    server.send(400, "text/plain", "Missing SSID");
+  }
+}
+
 // --- FreeRTOS Task for Core 0 (Network/IoT) ---
 void networkTask(void * pvParameters) {
+  // Load saved WiFi credentials
+  preferences.begin("wifi_creds", false);
+  ssid = preferences.getString("ssid", "YOUR_HOME_WIFI");
+  password = preferences.getString("password", "YOUR_WIFI_PASSWORD");
+
   // Connect to WiFi
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  WiFi.begin(ssid.c_str(), password.c_str());
   
   Serial.print("[Core 0] Connecting to WiFi");
   int attempts = 0;
@@ -471,9 +533,10 @@ void networkTask(void * pvParameters) {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/list", HTTP_GET, handleList);
   server.on("/download", HTTP_GET, handleDownload);
-  server.on("/downloadAll", HTTP_GET, handleDownloadAll); // TAR Download Route
+  server.on("/downloadAll", HTTP_GET, handleDownloadAll);
   server.on("/delete", HTTP_POST, handleDelete);
   server.on("/upload", HTTP_POST, handleUploadComplete, handleUpload);
+  server.on("/saveWifi", HTTP_POST, handleSaveWifi); // WiFi update route
 
   server.onNotFound([](){
     if (WiFi.getMode() == WIFI_AP) {
@@ -534,7 +597,6 @@ void setup() {
 
 void loop() {
   // This loop runs on Core 1. 
-  // We use it for background file processing (e.g., monitoring storage space)
   static unsigned long lastCheck = 0;
   if (millis() - lastCheck > 15000) { // Every 15 seconds
     lastCheck = millis();
